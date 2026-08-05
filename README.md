@@ -9,6 +9,12 @@ Carolina coast, but the sensors are written so the field logic works for
 **any** NDBC buoy or C-MAN weather station — you just swap in your own
 station ID(s).
 
+## Screenshot
+
+![Surf dashboard tab](screenshots/surf-tab.png)
+
+*My "Surf" dashboard tab, built entirely from the sensors in this repo.*
+
 ## What you get
 
 - **Wave conditions**: significant wave height, swell height/period/direction,
