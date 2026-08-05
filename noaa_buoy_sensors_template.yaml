@@ -1,0 +1,759 @@
+##############################################################################
+# NOAA / NDBC BUOY & WEATHER STATION DASHBOARD — Home Assistant Config
+##############################################################################
+#
+# WHAT THIS DOES
+# ---------------
+# Pulls live marine/weather data directly from NOAA's National Data Buoy
+# Center (NDBC) realtime text feeds (no API key required) and turns them
+# into Home Assistant sensors: wave height/period/direction, wind
+# speed/direction/gust, tides, water temp, and a "rising/falling/steady"
+# trend indicator — plus a locally-cached, auto-refreshing spectral wave
+# plot image (see the bottom of this file for that automation).
+#
+# DATA SOURCE
+# -----------
+# NDBC publishes plain-text data files at:
+#   https://www.ndbc.noaa.gov/data/realtime2/<STATION_ID>.<TYPE>
+# Common <TYPE> extensions used here:
+#   .txt    -> standard meteorological data (wind, pressure, air/water temp)
+#   .spec   -> spectral wave summary (wave height/period/direction, steepness)
+#   .swdir  -> raw spectral wave direction data (used here only to grab a
+#              reliable, frequently-updated "last observation" timestamp)
+# Full field docs: https://www.ndbc.noaa.gov/faq/measdes.shtml
+#
+# NOAA ASKS THAT YOU POLL RESPONSIBLY
+# ------------------------------------
+# NDBC's own FAQ asks users to "limit retrievals to a minimal level."
+# scan_interval: 600 (10 min) on these REST sensors is deliberate and safe.
+# Do NOT point a live/streaming camera entity directly at an NDBC URL —
+# Home Assistant polls camera entities continuously (every few seconds,
+# per viewer), which can look like abusive traffic and get your IP banned.
+# Instead, this config fetches the plot image on a matching schedule via
+# `downloader.download_file` and serves a LOCAL copy — see bottom of file.
+#
+# ADAPTING THIS FOR A DIFFERENT BUOY / STATION
+# ----------------------------------------------
+# 1. Find your station ID at https://www.ndbc.noaa.gov/ (map or search).
+# 2. Replace every occurrence of "41004" (primary buoy), "41076"
+#    (secondary/nearby buoy), and "FBIS1" (secondary wind-only C-MAN
+#    station) with your own station ID(s). Find/replace works fine —
+#    IDs are used consistently as literal strings throughout.
+# 3. Confirm your station actually reports the fields you want:
+#    not every buoy has spectral wave sensors (.spec/.swdir), and not
+#    every station reports wind. Check the raw .txt/.spec file in a
+#    browser first (https://www.ndbc.noaa.gov/data/realtime2/STATIONID.txt)
+#    to see which columns come back as real numbers vs. "MM" (missing).
+# 4. Field positions (data[N] below) come from the fixed-width column
+#    order NDBC uses for that file type — this order is standard across
+#    ALL stations of a given type, so once it works for one buoy it'll
+#    work for another using the same file type without changing indices.
+# 5. Update the tides/water-temp `station_id` values under the
+#    `noaa_tides` platform entries to your local NOAA CO-OPS tide
+#    station (find at https://tidesandcurrents.noaa.gov/).
+#
+# WHY SOME TEMPLATES LOOK LIKE `{{ this.state if this.state not in
+# ['unknown','unavailable',none] else none }}`
+# ------------------------------------------------------------------
+# NOAA buoys frequently report "MM" (missing measurement) for individual
+# fields — especially swell period/direction, which require enough
+# energy separation from wind-waves to calculate. Rather than flashing
+# to "unknown" every time a single field is briefly missing, these
+# sensors hold their last known good value until fresh real data
+# arrives. This is intentional, not a workaround for a bug.
+#
+##############################################################################
+
+
+##############################################################################
+# SECTION 1 — RAW DATA FETCHERS (REST sensors pulling NDBC's text files)
+##############################################################################
+sensor:
+
+  # --- Primary buoy: spectral wave summary (.spec) -------------------------
+  # Columns: YY MM DD hh mm WVHT SwH SwP WWH WWP SwD WWD STEEPNESS APD MWD
+  #           0  1  2  3  4   5    6   7   8   9   10  11     12       13  14
+  - platform: rest
+    name: NOAA Buoy 41004 Raw
+    resource: https://www.ndbc.noaa.gov/data/realtime2/41004.spec
+    method: GET
+    scan_interval: 600
+    value_template: >
+      {% set lines = value.split('\n') %}
+      {{ lines[2] if lines|length > 2 else 'Unavailable' }}
+
+  # --- Primary buoy: standard meteorological data (.txt) --------------------
+  # Columns: YY MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS PTDY TIDE
+  #           0  1  2  3  4   5     6   7    8    9   10  11   12    13   14   15   16  17    18
+  - platform: rest
+    name: NOAA Buoy 41004 Met Raw
+    resource: https://www.ndbc.noaa.gov/data/realtime2/41004.txt
+    method: GET
+    scan_interval: 600
+    value_template: >
+      {% set lines = value.split('\n') %}
+      {{ lines[2] if lines|length > 2 else 'Unavailable' }}
+
+  # --- Primary buoy: raw spectral direction file, trimmed to just the ------
+  # --- newest timestamp (used only for a reliable "last updated" clock) ---
+  # This file's data rows are ~900+ characters (40+ frequency/direction
+  # pairs), which exceeds Home Assistant's 255-character state limit — so
+  # instead of storing the whole row, this template extracts ONLY the
+  # 5 time fields (year month day hour minute) before it becomes the state.
+  - platform: rest
+    name: NOAA Buoy 41004 Swdir Raw Row
+    unique_id: buoy_41004_swdir_raw_row
+    resource: https://www.ndbc.noaa.gov/data/realtime2/41004.swdir
+    method: GET
+    scan_interval: 600
+    headers:
+      Range: "bytes=0-2000"   # wide enough to guarantee capturing 2 full lines
+    value_template: >-
+      {% set lines = value.split('\n') %}
+      {% set row = lines[1] if lines | length > 1 else '' %}
+      {% set parts = row.split() %}
+      {{ parts[0:5] | join(' ') if parts | length >= 5 else none }}
+
+  # --- Secondary/nearby buoy: standard meteorological data (.txt) ----------
+  # Same column layout as the primary buoy's .txt file above.
+  - platform: rest
+    name: NOAA Buoy 41076 Raw
+    resource: https://www.ndbc.noaa.gov/data/realtime2/41076.txt
+    method: GET
+    scan_interval: 600
+    value_template: >
+      {% set lines = value.split('\n') %}
+      {{ lines[2] if lines|length > 2 else 'Unavailable' }}
+
+  # --- Secondary wind-only C-MAN station (.txt) ----------------------------
+  # Same column layout as the standard meteorological file above.
+  - platform: rest
+    name: NOAA Station FBIS1 Raw
+    resource: https://www.ndbc.noaa.gov/data/realtime2/FBIS1.txt
+    method: GET
+    scan_interval: 600
+    value_template: >
+      {% set lines = value.split('\n') %}
+      {{ lines[2] if lines|length > 2 else 'Unavailable' }}
+
+  # --- Tide predictions & water temperature (NOAA CO-OPS, separate API) ----
+  # station_id values here are NOAA CO-OPS tide station IDs, NOT NDBC buoy
+  # IDs — find yours at https://tidesandcurrents.noaa.gov/
+  - platform: noaa_tides
+    name: tides
+    type: tides
+    station_id: TEC3127
+    scan_interval: 360
+
+  - platform: noaa_tides
+    name: water_temp
+    type: temp
+    station_id: 8665530
+    scan_interval: 360
+
+  - platform: noaa_tides
+    name: buoy
+    type: buoy
+    station_id: 41004
+    scan_interval: 360
+
+  # --- Generic time/date helper (used for timestamp formatting elsewhere) --
+  - platform: time_date
+    display_options:
+      - 'time'
+      - 'date'
+      - 'date_time'
+      - 'date_time_utc'
+      - 'date_time_iso'
+      - 'time_date'
+      - 'time_utc'
+
+
+##############################################################################
+# SECTION 2 — DERIVED SENSORS (template sensors computed from the raw feeds)
+##############################################################################
+template:
+  - sensor:
+
+      # ======================================================================
+      # -- WAVE CONDITIONS (primary buoy) --
+      # ======================================================================
+
+      # Significant wave height (ft), converted from meters in the .spec feed
+      - name: "41004 WVHT (ft)"
+        unique_id: buoy_41004_wvht_ft
+        icon: mdi:wave-arrow-up
+        unit_of_measurement: "ft"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 5 and data[5] != "MM" %}
+            {{ (data[5] | float * 3.28084) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Swell height (ft)
+      - name: "41004 SwH (ft)"
+        unique_id: buoy_41004_swh_ft
+        icon: mdi:wave-arrow-up
+        unit_of_measurement: "ft"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 6 and data[6] != "MM" %}
+            {{ (data[6] | float * 3.28084) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Swell period (s)
+      - name: "41004 SwP (s)"
+        unique_id: buoy_41004_swp_s
+        unit_of_measurement: "s"
+        icon: mdi:timer-outline
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 7 and data[7] != 'MM' %}
+            {{ data[7] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Wind wave height (ft)
+      - name: "41004 WWH (ft)"
+        unique_id: buoy_41004_wwh_ft
+        icon: mdi:wave-arrow-up
+        unit_of_measurement: "ft"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 8 and data[8] != "MM" %}
+            {{ (data[8] | float * 3.28084) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Wind wave period (s)
+      - name: "41004 WWP (s)"
+        unique_id: buoy_41004_wwp_s
+        icon: mdi:timer-outline
+        unit_of_measurement: "s"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 9 and data[9] != "MM" %}
+            {{ data[9] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Swell direction, compass letters (e.g. "SSW")
+      - name: "41004 SwD (compass)"
+        unique_id: buoy_41004_swd_compass
+        icon: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 10 %}
+            {% set dir = data[10] %}
+            {% if 'N' in dir and 'E' in dir %} mdi:arrow-bottom-left
+            {% elif 'S' in dir and 'E' in dir %} mdi:arrow-top-left
+            {% elif 'S' in dir and 'W' in dir %} mdi:arrow-top-right
+            {% elif 'N' in dir and 'W' in dir %} mdi:arrow-bottom-right
+            {% elif dir == 'N' %} mdi:arrow-down
+            {% elif dir == 'S' %} mdi:arrow-up
+            {% elif dir == 'E' %} mdi:arrow-left
+            {% elif dir == 'W' %} mdi:arrow-right
+            {% else %} mdi:waves
+            {% endif %}
+          {% else %} mdi:waves
+          {% endif %}
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 10 and data[10] != 'MM' %}
+            {{ data[10] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Wind wave direction, compass letters
+      # ICON is inverted (+180°) to show wave movement propagation (where waves move TO)
+      - name: "41004 WWD (compass)"
+        unique_id: buoy_41004_wwd_compass
+        icon: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 11 %}
+            {% set dir = data[11] %}
+            {% if 'N' in dir and 'E' in dir %} mdi:arrow-bottom-left
+            {% elif 'S' in dir and 'E' in dir %} mdi:arrow-top-left
+            {% elif 'S' in dir and 'W' in dir %} mdi:arrow-top-right
+            {% elif 'N' in dir and 'W' in dir %} mdi:arrow-bottom-right
+            {% elif dir == 'N' %} mdi:arrow-down
+            {% elif dir == 'S' %} mdi:arrow-up
+            {% elif dir == 'E' %} mdi:arrow-left
+            {% elif dir == 'W' %} mdi:arrow-right
+            {% else %} mdi:waves
+            {% endif %}
+          {% else %}
+            mdi:waves
+          {% endif %}
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 11 and data[11] != 'MM' %}
+            {{ data[11] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Average wave period (s)
+      - name: "41004 APD (s)"
+        unique_id: buoy_41004_apd_s
+        icon: mdi:chart-bell-curve
+        unit_of_measurement: "s"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 13 and data[13] != "MM" %}
+            {{ data[13] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Wave steepness category (text word reported directly by NOAA)
+      - name: "41004 Wave Steepness"
+        unique_id: buoy_41004_wave_steepness
+        icon: mdi:chart-bell-curve-cumulative
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 13 %}
+            {% set steep_words = ['SWELL', 'AVERAGE', 'STEEP', 'VERY_STEEP', 'N/A'] %}
+            {% set match = namespace(word='N/A') %}
+            {% for word in data %}
+              {% if word in steep_words %}
+                {% set match.word = word %}
+              {% endif %}
+            {% endfor %}
+            {{ match.word }}
+          {% else %}
+            N/A
+          {% endif %}
+
+      # Mean wave direction, compass letters, derived from the NOAA Tides
+      # integration's "buoy" sensor MWD attribute (an alternate data path
+      # to the same value already covered by 41004 WWD above)
+      # ICON is inverted (+180°) to show wave propagation direction
+      - name: "Wave direction (mean)"
+        unique_id: wave_direction
+        icon: >-
+          {% set deg_raw = state_attr('sensor.buoy', 'MWD') | float(default=nan) %}
+          {% if deg_raw == deg_raw %}
+            {% set deg = (deg_raw + 180) % 360 %}
+            {% set icons = [
+              'mdi:arrow-up', 'mdi:arrow-top-right', 'mdi:arrow-top-right', 'mdi:arrow-top-right',
+              'mdi:arrow-right', 'mdi:arrow-bottom-right','mdi:arrow-bottom-right','mdi:arrow-bottom-right',
+              'mdi:arrow-down', 'mdi:arrow-bottom-left','mdi:arrow-bottom-left','mdi:arrow-bottom-left',
+              'mdi:arrow-left', 'mdi:arrow-top-left', 'mdi:arrow-top-left', 'mdi:arrow-top-left'
+            ] %}
+            {% set idx = ((deg + 11.25) / 22.5) | int %}
+            {{ icons[idx % 16] }}
+          {% else %}
+            mdi:waves
+          {% endif %}
+        state: >-
+          {% set deg = state_attr('sensor.buoy', 'MWD') | float(default=nan) %}
+          {% if deg != deg %} Unknown
+          {% elif deg >= 348.75 or deg < 11.25 %}N
+          {% elif 11.25 <= deg < 33.75 %}NNE
+          {% elif 33.75 <= deg < 56.25 %}NE
+          {% elif 56.25 <= deg < 78.75 %}ENE
+          {% elif 78.75 <= deg < 101.25 %}E
+          {% elif 101.25 <= deg < 123.75 %}ESE
+          {% elif 123.75 <= deg < 146.25 %}SE
+          {% elif 146.25 <= deg < 168.75 %}SSE
+          {% elif 168.75 <= deg < 191.25 %}S
+          {% elif 191.25 <= deg < 213.75 %}SSW
+          {% elif 213.75 <= deg < 236.25 %}SW
+          {% elif 236.25 <= deg < 258.75 %}WSW
+          {% elif 258.75 <= deg < 281.25 %}W
+          {% elif 258.75 <= deg < 303.75 %}WNW
+          {% elif 303.75 <= deg < 326.25 %}NW
+          {% elif 326.25 <= deg < 348.75 %}NNW
+          {% else %}Unknown
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.buoy', 'MWD') is not none }}
+        attributes:
+          degrees: "{{ state_attr('sensor.buoy', 'MWD') | float(0) }}"
+
+      # Wave height (ft), alternate source via NOAA Tides integration's
+      # "buoy" sensor WVHT attribute (redundant with 41004 WVHT above,
+      # kept here since it's what the Wave Height Trend sensor originally
+      # used as an alternate reference point)
+      - name: "Wave height"
+        unique_id: wave_height
+        icon: mdi:waves
+        unit_of_measurement: "ft"
+        state: >-
+          {% set wvht = state_attr('sensor.buoy', 'WVHT') %}
+          {% if wvht is not none %}
+            {{ (wvht | float * 3.28084) | round(1) }}
+          {% else %}
+            {{ none }}
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.buoy', 'WVHT') is not none }}
+
+      # ======================================================================
+      # -- WIND CONDITIONS (primary buoy) --
+      # ======================================================================
+
+      # Wind direction, compass letters, from the .txt met feed
+      # ICON is inverted (+180°) to show wind propagation (where wind blows TO)
+      - name: "Buoy 41004 Wind Direction"
+        unique_id: buoy_41004_wind_direction
+        icon: >-
+          {% set data = states('sensor.noaa_buoy_41004_met_raw').split() %}
+          {% if data|length > 5 and data[5] != "MM" %}
+            {% set deg_raw = data[5] | float(default=0) %}
+            {% set deg = (deg_raw + 180) % 360 %}
+            {% set icons = [ 'mdi:arrow-up', 'mdi:arrow-top-right', 'mdi:arrow-top-right', 'mdi:arrow-top-right', 'mdi:arrow-right', 'mdi:arrow-bottom-right','mdi:arrow-bottom-right','mdi:arrow-bottom-right', 'mdi:arrow-down', 'mdi:arrow-bottom-left','mdi:arrow-bottom-left','mdi:arrow-bottom-left', 'mdi:arrow-left', 'mdi:arrow-top-left', 'mdi:arrow-top-left', 'mdi:arrow-top-left' ] %}
+            {% set idx = ((deg + 11.25) / 22.5) | int %}
+            {{ icons[idx % 16] }}
+          {% else %}
+            mdi:compass
+          {% endif %}
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_met_raw').split() %}
+          {% if data|length > 5 and data[5] != "MM" %}
+            {% set deg = data[5] | float(default=0) %}
+            {% set dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE', 'S','SSW','SW','WSW','W','WNW','NW','NNW'] %}
+            {% set idx = ((deg + 11.25) / 22.5) | int %}
+            {{ dirs[idx % 16] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+        attributes:
+          degrees: >-
+            {% set data = states('sensor.noaa_buoy_41004_met_raw').split() %}
+            {{ data[5] if data|length > 5 and data[5] != "MM" else 0 }}
+
+      # Wind speed (mph), converted from m/s
+      - name: "Buoy wind speed"
+        unique_id: buoy_41004_wind_speed
+        icon: mdi:weather-windy
+        unit_of_measurement: "mph"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_met_raw').split() %}
+          {% if data|length > 6 and data[6] != "MM" %}
+            {{ (data[6] | float * 2.23694) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+        availability: >-
+          {{ states('sensor.noaa_buoy_41004_met_raw') not in ['unknown', 'unavailable'] }}
+
+      # Wind gust (mph), converted from m/s
+      - name: "Buoy 41004 Wind Gust"
+        unique_id: buoy_41004_wind_gust
+        icon: mdi:weather-windy-variant
+        unit_of_measurement: "mph"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_met_raw').split() %}
+          {% if data|length > 7 and data[7] != "MM" %}
+            {{ (data[7] | float * 2.23694) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # ======================================================================
+      # -- SECONDARY BUOY (41076) WAVE DATA --
+      # ======================================================================
+
+      - name: "41076 WVHT (ft)"
+        unique_id: buoy_41076_wvht_ft
+        unit_of_measurement: "ft"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41076_raw').split() %}
+          {% if data|length > 8 and data[8] != "MM" %}
+            {{ (data[8] | float * 3.28084) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      - name: "41076 WPD (s)"
+        unique_id: buoy_41076_wpd_s
+        unit_of_measurement: "s"
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41076_raw').split() %}
+          {% if data|length > 9 and data[9] != "MM" %}
+            {{ data[9] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # ======================================================================
+      # -- SECONDARY WIND-ONLY STATION (FBIS1) --
+      # ======================================================================
+
+      # ICON is inverted (+180°) to show wind propagation (where wind blows TO)
+      - name: "Folly Island Wind Direction"
+        unique_id: fbis1_wind_direction
+        icon: >-
+          {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+          {% if data|length > 5 and data[5] != "MM" %}
+            {% set deg_raw = data[5] | float %}
+            {% set deg = (deg_raw + 180) % 360 %}
+            {% set icons = [
+              'mdi:arrow-up', 'mdi:arrow-top-right', 'mdi:arrow-top-right', 'mdi:arrow-top-right',
+              'mdi:arrow-right', 'mdi:arrow-bottom-right','mdi:arrow-bottom-right','mdi:arrow-bottom-right',
+              'mdi:arrow-down', 'mdi:arrow-bottom-left','mdi:arrow-bottom-left','mdi:arrow-bottom-left',
+              'mdi:arrow-left', 'mdi:arrow-top-left', 'mdi:arrow-top-left', 'mdi:arrow-top-left'
+            ] %}
+            {% set idx = ((deg + 11.25) / 22.5) | int %}
+            {{ icons[idx % 16] }}
+          {% else %}
+            mdi:compass-outline
+          {% endif %}
+        state: >-
+          {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+          {% if data|length > 5 and data[5] != "MM" %}
+            {% set deg = data[5] | float %}
+            {% set dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE', 'S','SSW','SW','WSW','W','WNW','NW','NNW'] %}
+            {% set idx = ((deg + 11.25) / 22.5) | int %}
+            {{ dirs[idx % 16] }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+        attributes:
+          degrees: >-
+            {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+            {{ data[5] if data|length > 5 and data[5] != "MM" else 0 }}
+
+      - name: "Folly Island Wind Speed"
+        unique_id: fbis1_wind_speed
+        icon: mdi:weather-windy
+        unit_of_measurement: "mph"
+        state: >-
+          {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+          {% if data|length > 6 and data[6] != "MM" %}
+            {{ (data[6] | float * 2.23694) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      - name: "Folly Island Wind Gust"
+        unique_id: fbis1_wind_gust
+        icon: mdi:weather-windy-variant
+        unit_of_measurement: "mph"
+        state: >-
+          {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+          {% if data|length > 7 and data[7] != "MM" %}
+            {{ (data[7] | float * 2.23694) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # Air temperature (°F), converted from Celsius. ATMP is column index 13
+      # in NDBC's standard meteorological (.txt) file layout.
+      - name: "Folly Island Air Temp"
+        unique_id: fbis1_air_temp_f
+        icon: mdi:thermometer
+        device_class: temperature
+        unit_of_measurement: "°F"
+        state: >-
+          {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+          {% if data|length > 13 and data[13] != "MM" %}
+            {{ (data[13] | float * 9/5 + 32) | round(1) }}
+          {% else %}
+            {{ this.state if this.state not in ['unknown','unavailable',none] else none }}
+          {% endif %}
+
+      # ======================================================================
+      # -- TIDES & MISC --
+      # ======================================================================
+
+      - name: "Next tide"
+        unique_id: next_tide
+        icon: >-
+          {% if is_state_attr('sensor.tides', 'next_tide_type', 'High') %}mdi:waves
+          {% else %}mdi:wave{% endif %}
+        state: >-
+          {% set ttype = state_attr('sensor.tides', 'next_tide_type') %}
+          {% set ttime = state_attr('sensor.tides', 'next_tide_time') %}
+          {% if ttype is not none and ttime is not none %}
+            {{ ttype }} tide at {{ ttime }}
+          {% else %}
+            unavailable
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.tides', 'next_tide_type') is not none and state_attr('sensor.tides', 'next_tide_time') is not none }}
+
+      - name: "Last tide"
+        unique_id: last_tide
+        icon: >-
+          {% if is_state_attr('sensor.tides', 'last_tide_type', 'High') %}mdi:waves
+          {% else %}mdi:wave{% endif %}
+        state: >-
+          {% set ttype = state_attr('sensor.tides', 'last_tide_type') %}
+          {% set ttime = state_attr('sensor.tides', 'last_tide_time') %}
+          {% if ttype is not none and ttime is not none %}
+            {{ ttype }} tide at {{ ttime }}
+          {% else %}
+            unavailable
+          {% endif %}
+        availability: >-
+          {{ state_attr('sensor.tides', 'last_tide_type') is not none and state_attr('sensor.tides', 'last_tide_time') is not none }}
+
+      - name: "Water level"
+        unique_id: water_level
+        unit_of_measurement: '%'
+        state: >-
+          {% set tf = state_attr('sensor.tides', 'tide_factor') %}
+          {% if tf is not none %}{{ tf }}{% else %}{{ none }}{% endif %}
+        availability: >-
+          {{ state_attr('sensor.tides', 'tide_factor') is not none }}
+
+      - name: "Air temperature"
+        unique_id: beach_air_temp
+        state: >-
+          {% set at = state_attr('sensor.water_temp', 'air_temperature') %}
+          {% if at is not none %}{{ at }}{% else %}{{ none }}{% endif %}
+        availability: >-
+          {{ state_attr('sensor.water_temp', 'air_temperature') is not none }}
+
+      # ======================================================================
+      # -- TIMESTAMPS --
+      # ======================================================================
+
+      - name: "41004 Data Last Updated"
+        unique_id: buoy_41004_last_updated
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: >-
+          {% set data = states('sensor.noaa_buoy_41004_raw').split() %}
+          {% if data|length > 4 %}
+            {% set year = data[0] %}
+            {% set month = data[1] %}
+            {% set day = data[2] %}
+            {% set hour = data[3] %}
+            {% set minute = data[4] %}
+            {{ year }}-{{ month }}-{{ day }}T{{ hour }}:{{ minute }}:00+00:00
+          {% else %}
+            {{ none }}
+          {% endif %}
+
+      - name: "FBIS1 Data Last Updated"
+        unique_id: fbis1_data_last_updated
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: >-
+          {% set data = states('sensor.noaa_station_fbis1_raw').split() %}
+          {% if data|length > 4 %}
+            {% set year = data[0] %}
+            {% set month = data[1] %}
+            {% set day = data[2] %}
+            {% set hour = data[3] %}
+            {% set minute = data[4] %}
+            {{ year }}-{{ month }}-{{ day }}T{{ hour }}:{{ minute }}:00+00:00
+          {% else %}
+            {{ none }}
+          {% endif %}
+
+      # Timestamp of the newest spectral observation, built from the trimmed
+      # swdir_raw_row REST sensor above (kept short to dodge the 255-char
+      # state limit; see SECTION 1 comment on that sensor for why).
+      - name: "Buoy 41004 Data Time"
+        unique_id: buoy_41004_swdir_time
+        device_class: timestamp
+        icon: mdi:clock-outline
+        state: >-
+          {% set raw = states('sensor.noaa_buoy_41004_swdir_raw_row') %}
+          {% if raw not in ['unknown','unavailable',''] %}
+            {% set p = raw.split() %}
+            {% if p | length >= 5 %}
+              {{ p[0] }}-{{ '%02d'|format(p[1]|int) }}-{{ '%02d'|format(p[2]|int) }}T{{ '%02d'|format(p[3]|int) }}:{{ '%02d'|format(p[4]|int) }}:00+00:00
+            {% else %}
+              {{ none }}
+            {% endif %}
+          {% else %}
+            {{ none }}
+          {% endif %}
+        availability: >-
+          {{ states('sensor.noaa_buoy_41004_swdir_raw_row') not in ['unknown','unavailable',''] }}
+
+  # ==========================================================================
+  # -- WAVE HEIGHT TREND (trigger-based) --
+  # ==========================================================================
+  # Unlike every sensor above (which recomputes on a schedule), this one is
+  # trigger-based: it only recalculates when sensor.41004_wvht_ft's VALUE
+  # actually changes, giving a true "previous vs. current" comparison via
+  # trigger.from_state / trigger.to_state — decoupled from how often the
+  # underlying REST sensor happens to poll.
+  - trigger:
+      - platform: state
+        entity_id: sensor.41004_wvht_ft
+    sensor:
+      - name: "41004 Wave Height Trend"
+        unique_id: buoy_41004_wvht_trend
+        icon: >-
+          {% set current = trigger.to_state.state | float(default=none) if trigger.to_state is not none else none %}
+          {% set previous = trigger.from_state.state | float(default=none) if trigger.from_state is not none else none %}
+          {% if current is not none and previous is not none %}
+            {% if current > previous %}
+              mdi:wave-arrow-up
+            {% elif current < previous %}
+              mdi:wave-arrow-down
+            {% else %}
+              mdi:waves
+            {% endif %}
+          {% else %}
+            mdi:waves
+          {% endif %}
+        state: >-
+          {% set current = trigger.to_state.state | float(default=none) if trigger.to_state is not none else none %}
+          {% set previous = trigger.from_state.state | float(default=none) if trigger.from_state is not none else none %}
+          {% if current is not none and previous is not none %}
+            {% if current > previous %}
+              Rising
+            {% elif current < previous %}
+              Falling
+            {% else %}
+              Steady
+            {% endif %}
+          {% else %}
+            Steady
+          {% endif %}
+
+
+##############################################################################
+# SECTION 3 — AUTO-REFRESHING SPECTRAL PLOT IMAGE (local cache, not a camera)
+##############################################################################
+#
+# The "Generic Camera" integration polls continuously and can trigger an
+# IP ban from NOAA if left pointed at their URL — DO NOT use it here.
+# Instead: set up the "Downloader" integration via Settings > Devices &
+# Services (UI-only in current HA versions, not YAML-configurable), set
+# its download folder to "www", then add an automation like this:
+#
+# alias: "Fetch 41004 Spectral Image"
+# trigger:
+#   - platform: time_pattern
+#     minutes: "22"
+#   - platform: time_pattern
+#     minutes: "52"
+# action:
+#   - service: downloader.download_file
+#     data:
+#       url: "https://www.ndbc.noaa.gov/plot?station=41004&meas=spec"
+#       filename: "41004_spec.png"
+#       overwrite: true
+#
+# NOAA updates this specific plot at :20 and :50 past the hour, so the
+# automation above fires 2 minutes later to be safe. Adjust minutes if
+# your station's update cadence differs.
+#
+# Dashboard card (Markdown card — plain `picture` cards don't reliably
+# re-evaluate Jinja templates, so the cache-busting query string never
+# actually changes and browsers keep serving a stale cached image):
+#
+# type: markdown
+# content: >-
+#   <a href="https://www.ndbc.noaa.gov/show_plot.php?station=41004&meas=spec&uom=E" target="_blank">
+#   <img src="/local/41004_spec.png?v={{ now().timestamp() | int }}" style="width:100%;">
+#   </a>
+#
+##############################################################################
